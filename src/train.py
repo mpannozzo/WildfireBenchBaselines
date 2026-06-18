@@ -4,6 +4,7 @@ from dataloader.FireSpreadDataModule import FireSpreadDataModule
 from pytorch_lightning.cli import LightningCLI
 from models import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  # noqa
 from models import BaseModel
+from evaluation.unified_eval_callback import UnifiedEvalCallback  # noqa
 import wandb
 import os
 
@@ -79,6 +80,7 @@ class MyLightningCLI(LightningCLI):
         wandb.define_metric("val_loss", summary="min")
         wandb.define_metric("train_f1_epoch", summary="max")
         wandb.define_metric("val_f1", summary="max")
+        wandb.define_metric("eval/*", step_metric="epoch")
 
 
 def main():

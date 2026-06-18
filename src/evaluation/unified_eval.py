@@ -215,6 +215,103 @@ def evaluate_ddpm(model, diffusion, eval_loader, device, epoch=None,
 # Lightning model evaluation (discriminative baselines)
 # ---------------------------------------------------------------------------
 
+def _move_batch_to_device(batch, device):
+    if len(batch) == 3:
+        x, y, doys = batch
+        return x.to(device), y.to(device), doys.to(device)
+    x, y = batch
+    return x.to(device), y.to(device)
+
+
+def _collect_lightning_predictions(
+    pl_module,
+    eval_loader,
+    device,
+    model_name: str,
+    verbose: bool,
+    max_batches=None,
+):
+    """Run inference via the Lightning module's own get_pred_and_gt path."""
+    pl_module.eval()
+
+    all_targets = []
+    all_scores = []
+
+    with torch.no_grad():
+        for step, batch in enumerate(eval_loader):
+            if max_batches is not None and step >= max_batches:
+                break
+
+            batch = _move_batch_to_device(batch, device)
+            y_hat, y = pl_module.get_pred_and_gt(batch)
+            prob = torch.sigmoid(y_hat)
+
+            all_targets.append(y.cpu().numpy().flatten())
+            all_scores.append(prob.cpu().numpy().flatten())
+
+            if verbose and step % 50 == 0:
+                print(f"  [{model_name}] {step}/{len(eval_loader)} batches...")
+
+    return all_targets, all_scores
+
+
+def evaluate_lightning_module(
+    pl_module,
+    eval_loader,
+    device,
+    model_name: str = "model",
+    epoch=None,
+    threshold: float = 0.5,
+    wandb_log: bool = True,
+    verbose: bool = True,
+    max_batches=None,
+) -> dict:
+    """
+    Evaluate a PyTorch Lightning BaseModel subclass through the unified harness.
+
+    Uses get_pred_and_gt so temporal flattening, doy features, and tiled
+    inference all match the training-time code path.
+    """
+    tag = f"epoch_{epoch}" if epoch is not None else "final"
+
+    all_targets, all_scores = _collect_lightning_predictions(
+        pl_module=pl_module,
+        eval_loader=eval_loader,
+        device=device,
+        model_name=model_name,
+        verbose=verbose,
+        max_batches=max_batches,
+    )
+
+    targets_flat = np.concatenate(all_targets)
+    scores_flat = np.concatenate(all_scores)
+    binary_flat = (scores_flat >= threshold).astype(np.float32)
+
+    ap = float(average_precision_score(targets_flat, scores_flat))
+
+    p, r, f1, _ = precision_recall_fscore_support(
+        targets_flat, binary_flat,
+        labels=[1], average=None, zero_division=0,
+    )
+    precision = float(p[0])
+    recall = float(r[0])
+    f1_score = float(f1[0])
+
+    tp = float(np.sum((binary_flat == 1) & (targets_flat == 1)))
+    fp = float(np.sum((binary_flat == 1) & (targets_flat == 0)))
+    fn = float(np.sum((binary_flat == 0) & (targets_flat == 1)))
+    iou = tp / (tp + fp + fn + 1e-8)
+
+    results = dict(ap=ap, f1=f1_score, precision=precision, recall=recall, iou=iou)
+
+    if verbose:
+        _print_results(model_name, tag, results, threshold)
+    if wandb_log:
+        _log_to_wandb(model_name, tag, epoch, results)
+
+    return results
+
+
 def evaluate_lightning_model(
     model, datamodule, device, model_name: str, wandb_log: bool = True,
 ) -> dict:
@@ -223,20 +320,15 @@ def evaluate_lightning_model(
     giving discriminative models identical metric computation to generative ones.
     """
     model.to(device)
-    model.eval()
 
     datamodule.setup("test")
     test_loader = datamodule.test_dataloader()
 
-    def predict_fn(x0):
-        x0 = x0[:, 0, :, :, :]   # [B, C, H, W]
-        logits = model(x0)
-        prob = torch.sigmoid(logits)
-        if prob.dim() == 3:
-            prob = prob.unsqueeze(1)
-        return prob
-
-    return evaluate_model(
-        predict_fn=predict_fn, eval_loader=test_loader, device=device,
-        model_name=model_name, epoch=None, wandb_log=wandb_log,
+    return evaluate_lightning_module(
+        pl_module=model,
+        eval_loader=test_loader,
+        device=device,
+        model_name=model_name,
+        epoch=None,
+        wandb_log=wandb_log,
     )
