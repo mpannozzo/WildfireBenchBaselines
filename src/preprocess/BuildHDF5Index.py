@@ -13,12 +13,15 @@ import argparse
 import glob
 import os
 import sys
+from pathlib import Path
 
-sys.path.append(os.path.abspath(os.path.dirname(__file__).split("/src")[-2]))
+_SRC_DIR = Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 from tqdm import tqdm
 
-from src.dataloader.hdf5_cache import read_n_timesteps, save_hdf5_index, load_hdf5_index
+from dataloader.hdf5_cache import read_n_timesteps, save_hdf5_index, load_hdf5_index
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
