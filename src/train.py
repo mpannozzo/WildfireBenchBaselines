@@ -70,6 +70,9 @@ class MyLightningCLI(LightningCLI):
         Also define min and max metrics in wandb, because otherwise it just reports the 
         last known values, which is not what we want.
         """
+        if wandb.run is None:
+            return
+
         config_file_name = os.path.join(wandb.run.dir, "cli_config.yaml")
 
         cfg_string = self.parser.dump(self.config, skip_none=False)
@@ -89,7 +92,6 @@ def main():
     # and instantiates the model and datamodule. For this, it's important to import the model and datamodule classes above.
     cli = MyLightningCLI(BaseModel, FireSpreadDataModule, subclass_mode_model=True, save_config_kwargs={
         "overwrite": True}, parser_kwargs={"parser_mode": "yaml"}, run=False)
-    cli.wandb_setup()
 
     if cli.config.do_train:
         cli.trainer.fit(cli.model, cli.datamodule,
@@ -120,8 +122,9 @@ def main():
         fire_masks_combined = torch.cat(
             [x_af.unsqueeze(0), y_hat.unsqueeze(0), y.unsqueeze(0)], axis=0)
 
+        run_id = wandb.run.id if wandb.run is not None else "local"
         predictions_file_name = os.path.join(
-            cli.config.trainer.default_root_dir, f"predictions_{wandb.run.id}.pt")
+            cli.config.trainer.default_root_dir, f"predictions_{run_id}.pt")
         torch.save(fire_masks_combined, predictions_file_name)
 
 
