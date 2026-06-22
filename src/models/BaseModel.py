@@ -44,7 +44,18 @@ class BaseModel(pl.LightningModule, ABC):
             image, and aggregate the results. This also works for non-square images. 
         """
         super().__init__(*args, **kwargs)
-        self.save_hyperparameters()
+        # Save by explicit name so these are captured from BaseModel's own frame.
+        # Subclasses forward these via **kwargs; modern PyTorch Lightning's
+        # no-arg save_hyperparameters() inspects the subclass signature and would
+        # otherwise drop kwargs-passed values like loss_function.
+        self.save_hyperparameters(
+            "n_channels",
+            "flatten_temporal_dimension",
+            "pos_class_weight",
+            "loss_function",
+            "use_doy",
+            "required_img_size",
+        )
 
         if required_img_size is not None:
             self.hparams.required_img_size = torch.Size(
