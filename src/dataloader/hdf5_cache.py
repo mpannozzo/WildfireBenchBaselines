@@ -55,32 +55,57 @@ def _cache_path(src_path: str) -> str:
 
 
 def cached_hdf5_path(src_path: str, retries: int = 5) -> str:
-    """Return a local path for reading an HDF5 file, copying from cloud if needed."""
+    """Return a local path for reading an HDF5 file, copying from cloud if needed.
+
+    Safe for concurrent DataLoader workers: each worker copies to a unique temp
+    file and then atomically renames it into place. This avoids the race where
+    one worker reads (or removes) a destination file that another worker is
+    still mid-write, which surfaced as h5py "file signature not found" errors.
+    """
     if not should_use_cache(src_path):
         return src_path
 
     dst = _cache_path(src_path)
-    if os.path.isfile(dst):
+
+    try:
+        src_size = os.path.getsize(src_path)
+    except OSError:
+        # Can't stat the source; let the caller's open() raise a clear error.
+        return src_path
+
+    if os.path.isfile(dst) and os.path.getsize(dst) == src_size:
+        return dst
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+    last_err = None
+    for attempt in range(retries):
+        # Another worker may have finished the copy while we were waiting.
         try:
-            if os.path.getsize(dst) == os.path.getsize(src_path):
+            if os.path.isfile(dst) and os.path.getsize(dst) == src_size:
                 return dst
         except OSError:
             pass
 
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.isfile(dst):
-        os.remove(dst)
-
-    last_err = None
-    for attempt in range(retries):
+        # Unique per-process/per-attempt temp path so concurrent workers never
+        # write to the same file. os.replace into dst is atomic on the same
+        # filesystem, so readers only ever see a complete file.
+        tmp = f"{dst}.tmp.{os.getpid()}.{attempt}"
         try:
-            src_size = os.path.getsize(src_path)
-            shutil.copy2(src_path, dst)
-            if os.path.getsize(dst) == src_size:
+            shutil.copy2(src_path, tmp)
+            if os.path.getsize(tmp) == src_size:
+                os.replace(tmp, dst)
                 return dst
         except OSError as err:
             last_err = err
-            time.sleep(min(2 ** attempt, 30))
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+        time.sleep(min(2 ** attempt, 30))
 
     raise OSError(
         f"Failed to cache HDF5 from cloud storage after {retries} attempts: {src_path}"
