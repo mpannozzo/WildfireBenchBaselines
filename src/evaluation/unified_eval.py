@@ -42,10 +42,14 @@ Baselines (WildfireSpreadTS, 12-fold mean, "All" feature set)
   run noticeably higher because 2021 is an easy test year (see suppl. Fig 2).
 """
 
-import numpy as np
 import torch
+import torchmetrics
 import wandb
-from sklearn.metrics import average_precision_score, precision_recall_fscore_support
+
+# Number of thresholds used for the streaming AveragePrecision estimate. Using a
+# fixed grid keeps memory bounded (a small per-threshold confusion matrix)
+# instead of retaining every pixel score across the whole test set.
+_AP_THRESHOLDS = 200
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +81,11 @@ def evaluate_model(
     """
     tag = f"epoch_{epoch}" if epoch is not None else "final"
 
-    all_targets = []
-    all_scores  = []
+    f1_metric = torchmetrics.F1Score("binary", threshold=threshold).to(device)
+    precision_metric = torchmetrics.Precision("binary", threshold=threshold).to(device)
+    recall_metric = torchmetrics.Recall("binary", threshold=threshold).to(device)
+    iou_metric = torchmetrics.JaccardIndex("binary", threshold=threshold).to(device)
+    ap_metric = torchmetrics.AveragePrecision("binary", thresholds=_AP_THRESHOLDS).to(device)
 
     with torch.no_grad():
         for step, (x0, x1) in enumerate(eval_loader):
@@ -87,34 +94,25 @@ def evaluate_model(
             x0 = x0.to(device)
             x1 = x1.to(device)
 
-            prob = predict_fn(x0)          # [B, 1, H, W], values in [0, 1]
+            prob = predict_fn(x0).flatten()   # values in [0, 1]
+            target = x1.flatten().long()
 
-            all_targets.append(x1.cpu().numpy().flatten())
-            all_scores.append(prob.cpu().numpy().flatten())
+            f1_metric.update(prob, target)
+            precision_metric.update(prob, target)
+            recall_metric.update(prob, target)
+            iou_metric.update(prob, target)
+            ap_metric.update(prob, target)
 
             if verbose and step % 50 == 0:
                 print(f"  [{model_name}] {step}/{len(eval_loader)} batches...")
 
-    targets_flat = np.concatenate(all_targets)
-    scores_flat  = np.concatenate(all_scores)
-    binary_flat  = (scores_flat >= threshold).astype(np.float32)
-
-    ap = float(average_precision_score(targets_flat, scores_flat))
-
-    p, r, f1, _ = precision_recall_fscore_support(
-        targets_flat, binary_flat,
-        labels=[1], average=None, zero_division=0,
+    results = dict(
+        ap=float(ap_metric.compute()),
+        f1=float(f1_metric.compute()),
+        precision=float(precision_metric.compute()),
+        recall=float(recall_metric.compute()),
+        iou=float(iou_metric.compute()),
     )
-    precision = float(p[0])
-    recall    = float(r[0])
-    f1_score  = float(f1[0])
-
-    tp = float(np.sum((binary_flat == 1) & (targets_flat == 1)))
-    fp = float(np.sum((binary_flat == 1) & (targets_flat == 0)))
-    fn = float(np.sum((binary_flat == 0) & (targets_flat == 1)))
-    iou = tp / (tp + fp + fn + 1e-8)
-
-    results = dict(ap=ap, f1=f1_score, precision=precision, recall=recall, iou=iou)
 
     if verbose:
         _print_results(model_name, tag, results, threshold)
@@ -166,38 +164,6 @@ def _move_batch_to_device(batch, device):
     return x.to(device), y.to(device)
 
 
-def _collect_lightning_predictions(
-    pl_module,
-    eval_loader,
-    device,
-    model_name: str,
-    verbose: bool,
-    max_batches=None,
-):
-    """Run inference via the Lightning module's own get_pred_and_gt path."""
-    pl_module.eval()
-
-    all_targets = []
-    all_scores = []
-
-    with torch.no_grad():
-        for step, batch in enumerate(eval_loader):
-            if max_batches is not None and step >= max_batches:
-                break
-
-            batch = _move_batch_to_device(batch, device)
-            y_hat, y = pl_module.get_pred_and_gt(batch)
-            prob = torch.sigmoid(y_hat)
-
-            all_targets.append(y.cpu().numpy().flatten())
-            all_scores.append(prob.cpu().numpy().flatten())
-
-            if verbose and step % 50 == 0:
-                print(f"  [{model_name}] {step}/{len(eval_loader)} batches...")
-
-    return all_targets, all_scores
-
-
 def evaluate_lightning_module(
     pl_module,
     eval_loader,
@@ -214,38 +180,50 @@ def evaluate_lightning_module(
 
     Uses get_pred_and_gt so temporal flattening, doy features, and tiled
     inference all match the training-time code path.
+
+    Metrics are accumulated incrementally with torchmetrics rather than by
+    concatenating every pixel across the test set. The previous implementation
+    retained all scores/targets in host RAM and then ran sklearn's
+    average_precision_score (which sorts the full array), which OOM-crashed at
+    the aggregation step on large test sets. The streaming approach uses bounded
+    memory and matches BaseModel.test_step's metric definitions.
     """
     tag = f"epoch_{epoch}" if epoch is not None else "final"
 
-    all_targets, all_scores = _collect_lightning_predictions(
-        pl_module=pl_module,
-        eval_loader=eval_loader,
-        device=device,
-        model_name=model_name,
-        verbose=verbose,
-        max_batches=max_batches,
+    pl_module.eval()
+
+    f1_metric = torchmetrics.F1Score("binary", threshold=threshold).to(device)
+    precision_metric = torchmetrics.Precision("binary", threshold=threshold).to(device)
+    recall_metric = torchmetrics.Recall("binary", threshold=threshold).to(device)
+    iou_metric = torchmetrics.JaccardIndex("binary", threshold=threshold).to(device)
+    ap_metric = torchmetrics.AveragePrecision("binary", thresholds=_AP_THRESHOLDS).to(device)
+
+    with torch.no_grad():
+        for step, batch in enumerate(eval_loader):
+            if max_batches is not None and step >= max_batches:
+                break
+
+            batch = _move_batch_to_device(batch, device)
+            y_hat, y = pl_module.get_pred_and_gt(batch)
+            prob = torch.sigmoid(y_hat).flatten()
+            target = y.flatten().long()
+
+            f1_metric.update(prob, target)
+            precision_metric.update(prob, target)
+            recall_metric.update(prob, target)
+            iou_metric.update(prob, target)
+            ap_metric.update(prob, target)
+
+            if verbose and step % 50 == 0:
+                print(f"  [{model_name}] {step}/{len(eval_loader)} batches...")
+
+    results = dict(
+        ap=float(ap_metric.compute()),
+        f1=float(f1_metric.compute()),
+        precision=float(precision_metric.compute()),
+        recall=float(recall_metric.compute()),
+        iou=float(iou_metric.compute()),
     )
-
-    targets_flat = np.concatenate(all_targets)
-    scores_flat = np.concatenate(all_scores)
-    binary_flat = (scores_flat >= threshold).astype(np.float32)
-
-    ap = float(average_precision_score(targets_flat, scores_flat))
-
-    p, r, f1, _ = precision_recall_fscore_support(
-        targets_flat, binary_flat,
-        labels=[1], average=None, zero_division=0,
-    )
-    precision = float(p[0])
-    recall = float(r[0])
-    f1_score = float(f1[0])
-
-    tp = float(np.sum((binary_flat == 1) & (targets_flat == 1)))
-    fp = float(np.sum((binary_flat == 1) & (targets_flat == 0)))
-    fn = float(np.sum((binary_flat == 0) & (targets_flat == 1)))
-    iou = tp / (tp + fp + fn + 1e-8)
-
-    results = dict(ap=ap, f1=f1_score, precision=precision, recall=recall, iou=iou)
 
     if verbose:
         _print_results(model_name, tag, results, threshold)

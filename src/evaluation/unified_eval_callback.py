@@ -9,7 +9,7 @@ class UnifiedEvalCallback(Callback):
 
     def __init__(
         self,
-        eval_every_n_epochs: int = 5,
+        eval_every_n_epochs: int = 10,
         max_batches: int | None = None,
         threshold: float = 0.5,
         wandb_log: bool = True,
