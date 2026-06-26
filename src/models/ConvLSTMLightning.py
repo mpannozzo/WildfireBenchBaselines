@@ -1,4 +1,4 @@
-from typing import Any, Tuple
+from typing import Any, List
 
 import torch.nn as nn
 
@@ -43,12 +43,19 @@ class ConvLSTMLightning(BaseModel):
         n_channels: int,
         flatten_temporal_dimension: bool,
         pos_class_weight: float,
-        img_height_width: Tuple[int, int],
-        kernel_size: Tuple[int, int],
+        img_height_width: List[int],
+        kernel_size: List[int],
         num_layers: int,
         *args: Any,
         **kwargs: Any
     ):
+        # Accept lists from the config (newer jsonargparse fails to adapt
+        # Tuple[int, int] hints), then convert to tuples. ConvLSTM's internals
+        # unpack input_size and require kernel_size to be a tuple
+        # (see ConvLSTM._check_kernel_size_consistency).
+        img_height_width = tuple(img_height_width)
+        kernel_size = tuple(kernel_size)
+
         super().__init__(
             n_channels=n_channels,
             flatten_temporal_dimension=flatten_temporal_dimension,
