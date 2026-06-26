@@ -58,9 +58,7 @@ class BaseModel(pl.LightningModule, ABC):
         })
 
         if required_img_size is not None:
-            self.hparams.required_img_size = torch.Size(
-                required_img_size, device=self.device
-            )
+            self.hparams.required_img_size = torch.Size(required_img_size)
 
         # Normalize class weights by assuming that the negative class has weight 1
         if self.hparams.loss_function == "Focal" and self.hparams.pos_class_weight > 1:
